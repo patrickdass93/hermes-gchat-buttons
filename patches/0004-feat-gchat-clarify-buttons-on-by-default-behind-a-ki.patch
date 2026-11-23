@@ -1,0 +1,178 @@
+From b123c08b12af12cfb93bc875bde9c7465c69ca1a Mon Sep 17 00:00:00 2001
+From: patrickdass93 <patrickdass93@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:16:45 +0800
+Subject: [PATCH 4/4] feat(gchat): clarify buttons on by default behind a
+ kill-switch; log the text fallback
+
+The clarify card now carries a typed-path hint as well: CARD_CLICKED rides a
+Google-side publish leg the gateway can neither observe nor repair, and when
+it fails the tap vanishes with no error chip and no log line, while a typed
+reply always resolves. platforms.google_chat.clarify_buttons (default true) is
+a kill-switch that restores the base-class numbered-text prompt.
+
+The card-to-text fallback that already existed was silent: send_clarify
+returns the text prompt's successful result, so a failed card send left no
+trace anywhere. It now logs the card error at WARNING first.
+---
+ plugins/platforms/google_chat/adapter.py      | 13 ++++
+ tests/gateway/test_google_chat_card_click.py  | 61 +++++++++++++++++++
+ .../docs/user-guide/messaging/google_chat.md  | 25 ++++++--
+ 3 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index fe0bd43866..6593412b0f 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -455,6 +455,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
+             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
+         self._http_events_service_account_email = self._str_setting(
+             extra, "http_events_service_account_email", "GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL").lower()
++        # Clarify buttons are ON by default. ``clarify_buttons: false`` under
++        # platforms.google_chat is a kill-switch that restores the base-class
++        # numbered-text prompt (typed replies resolve a button card too).
++        self._clarify_buttons = bool(extra.get("clarify_buttons", True))
+ 
+     @staticmethod
+     def _int_setting(extra: dict[str, Any], key: str, env_name: str, default: int) -> int:
+@@ -1278,6 +1282,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         if not choices:
+             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
++        if not self._clarify_buttons:
++            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+ 
+         # Pub/Sub-connected apps: Chat publishes the CARD_CLICKED event to the
+         # topic named by the button's action function — a bare function name
+@@ -1314,10 +1320,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         })
+         if numbered:
+             card["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"] += f"\n\n{numbered}"
++        # Advertise the typed path on the card as well: the click publish leg is
++        # Google-side and can fail without a trace, while a typed reply always resolves.
++        card["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"] += (
++            f"\n\n{t('gateway.clarify.hint_single')}")
+         result = await self.send_card(chat_id, card, metadata=metadata)
+         if result.success:
+             self._clarify_state[clarify_id] = session_key
+             return result
++        # The text fallback below is a success from the caller's side, so this is the
++        # only place a failed card send is visible: log it, never swallow it.
++        logger.warning("[GoogleChat] clarify card failed (%s); falling back to the text prompt", result.error)
+         return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+ 
+     async def _handle_card_click(self, envelope: dict[str, Any]) -> None:
+diff --git a/tests/gateway/test_google_chat_card_click.py b/tests/gateway/test_google_chat_card_click.py
+index 2edc707188..dcbc4c9a68 100644
+--- a/tests/gateway/test_google_chat_card_click.py
++++ b/tests/gateway/test_google_chat_card_click.py
+@@ -17,6 +17,8 @@ import pytest
+ from tests.gateway.test_google_chat import GoogleChatAdapter, adapter, _make_pubsub_message  # importing installs the google stubs first
+ import plugins.platforms.google_chat.adapter as _gc_mod
+ import tools.clarify_gateway as _cg
++from gateway.config import PlatformConfig
++from gateway.platforms.base import BasePlatformAdapter
+ 
+ SUB = "projects/test-project/subscriptions/gchat-acme-hermes-sub"
+ REAL_TOPIC = "projects/test-project/topics/gchat-acme-hermes"  # the real binding, no "-sub"
+@@ -392,3 +394,62 @@ class TestClickRoutingByShape:
+         assert "keys=['chat']" in line.getMessage()
+         assert "<redacted:" in line.getMessage() and "hunter2" not in line.getMessage()
+         adapter.handle_message.assert_not_awaited()
++
++
++# ===========================================================================
++# Clarify card send: buttons by default, kill-switch, text fallback
++# ===========================================================================
++
++
++@pytest.fixture()
++def base_clarify(monkeypatch):
++    """The base-class numbered-text prompt, so tests can see when the card path defers to it."""
++    mock = AsyncMock(return_value=MagicMock(success=True, message_id="text/1", error=None))
++    monkeypatch.setattr(BasePlatformAdapter, "send_clarify", mock)
++    return mock
++
++
++def _ok_create(adapter):
++    adapter._create_message = AsyncMock(
++        return_value=MagicMock(success=True, message_id="m/1", error=None, raw_response=None))
++
++
++class TestClarifyButtons:
++    def test_buttons_are_on_by_default(self, adapter):
++        assert adapter._clarify_buttons is True
++
++    def test_kill_switch_is_read_from_the_platform_config_block(self):
++        cfg = PlatformConfig.from_dict({"enabled": True, "clarify_buttons": False})
++        assert cfg.extra["clarify_buttons"] is False
++        assert GoogleChatAdapter(cfg)._clarify_buttons is False
++
++    @pytest.mark.asyncio
++    async def test_kill_switch_restores_the_text_prompt(self, adapter, base_clarify):
++        adapter._clarify_buttons = False
++        _ok_create(adapter)
++
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        base_clarify.assert_awaited_once()
++        adapter._create_message.assert_not_awaited()
++        assert "c1" not in adapter._clarify_state
++
++    @pytest.mark.asyncio
++    async def test_card_send_failure_falls_back_to_the_text_prompt_and_is_logged(self, adapter, base_clarify, caplog):
++        adapter._create_message = AsyncMock(side_effect=ConnectionError("chat api 503"))
++
++        with caplog.at_level(logging.WARNING):
++            result = await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        assert result is base_clarify.return_value, "the caller gets the text prompt's result"
++        assert "clarify card failed (chat api 503); falling back to the text prompt" in caplog.text
++        assert "c1" not in adapter._clarify_state
++
++    @pytest.mark.asyncio
++    async def test_card_advertises_the_typed_path(self, adapter):
++        from agent.i18n import t
++
++        _ok_create(adapter)
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++        widgets = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"]
++        assert widgets[0]["textParagraph"]["text"].endswith(t("gateway.clarify.hint_single"))
+diff --git a/website/docs/user-guide/messaging/google_chat.md b/website/docs/user-guide/messaging/google_chat.md
+index ebc8e582f9..4cfe9b4302 100644
+--- a/website/docs/user-guide/messaging/google_chat.md
++++ b/website/docs/user-guide/messaging/google_chat.md
+@@ -250,10 +250,27 @@ separate Hermes session.
+ When the agent asks a multiple-choice clarify question, the adapter renders it
+ as a native **Card v2** with one button per choice plus an
+ **"Other / type answer"** button, instead of a plain numbered text list.
+-Clicking a button answers the question directly (`CARD_CLICKED` events route
+-the choice back into the waiting session). If the card fails to send, or the
+-question has no fixed choices, the adapter falls back to the standard text
+-clarify. No configuration needed.
++Clicking a button answers the question directly: the click travels back
++through the same Pub/Sub subscription (each button names the subscription's
++topic), resolves the waiting session, and the card is patched in place to show
++who answered what. The card also lists the options as text, so a typed reply
++(the number, the option text, or your own answer) works too — that is the
++resilient path, because the click's publish leg is Google-side and can fail
++without any trace on your side. If the card fails to send, or the question has
++no fixed choices, the adapter falls back to the standard text clarify and logs
++the card failure at WARNING.
++
++Buttons are on by default. To switch them off and get plain numbered text
++prompts only, set in `config.yaml`:
++
++```yaml
++platforms:
++  google_chat:
++    clarify_buttons: false
++```
++
++The setting is read once when the adapter starts, so restart the gateway after
++changing it.
+ 
+ ---
+ 
+-- 
+2.53.0
+

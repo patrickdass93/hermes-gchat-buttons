@@ -1,0 +1,210 @@
+From be2056ac9e9eac0044db86f03688dad3c018d121 Mon Sep 17 00:00:00 2001
+From: patrickdass93 <patrickdass93@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:07:30 +0800
+Subject: [PATCH 1/4] fix(gchat): name the subscription's real topic on clarify
+ buttons
+
+A Pub/Sub-connected Chat app publishes the CARD_CLICKED event to the topic
+named by the button's onClick.action.function. The clarify card sent a bare
+function name ("hermes_clarify"), an invalid resource name: the click died at
+publish with "Invalid resource name" in the project's gsuiteaddons error log,
+the user saw "<app> is unable to process your request", and nothing reached
+the gateway.
+
+Buttons now carry the full topic path. At connect, _check_subscription keeps
+the topic field of the subscriptions().get() response in _click_topic_path;
+the "/subscriptions/" -> "/topics/" name transform stays only as a fallback,
+because it is wrong whenever the topic is off-convention (a "<name>-sub"
+subscription bound to a "<name>" topic 404s on every click). HTTP-callback
+mode has no topic and keeps the bare actionMethodName.
+---
+ plugins/platforms/google_chat/adapter.py     | 33 ++++++-
+ tests/gateway/test_google_chat.py            |  4 +-
+ tests/gateway/test_google_chat_card_click.py | 95 ++++++++++++++++++++
+ 3 files changed, 129 insertions(+), 3 deletions(-)
+ create mode 100644 tests/gateway/test_google_chat_card_click.py
+
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index 3b792001a6..b2802ab5ef 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -406,6 +406,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         _load_google_modules()
+         self._subscriber = self._chat_api = self._credentials = self._streaming_pull_future = None
+         self._project_id = self._subscription_path = self._bot_user_id = None  # bot id is users/{id}
++        self._click_topic_path: Optional[str] = None  # REAL topic the subscription binds to; card clicks publish here
+         self._supervisor_task: Optional[asyncio.Task] = None
+         self._loop: Optional[asyncio.AbstractEventLoop] = None
+         # The profile scope this adapter was connected under (multiplex: HERMES_HOME override + secret
+@@ -624,13 +625,26 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         }
+         self._subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+         try:
+-            await asyncio.to_thread(lambda: self._subscriber.get_subscription(request={"subscription": subscription_path}))
++            sub = await asyncio.to_thread(lambda: self._subscriber.get_subscription(request={"subscription": subscription_path}))
+         except (gax_exceptions.NotFound, gax_exceptions.PermissionDenied) as exc:
+             code, message = fatals[type(exc)]
+             self._set_fatal_error(code=code, message=message, retryable=False)
+             return False
+         except Exception as exc:
+             return self._connect_failed("[GoogleChat] subscription.get failed: %s", exc, "subscription_check", retryable=True)
++        # The get_subscription response carries the subscription's REAL topic
++        # binding. Button clicks publish to the topic named by the button action,
++        # and deriving it from the subscription NAME ("/subscriptions/" →
++        # "/topics/") 404s whenever the topic is off-convention: every click
++        # dies at publish and the user sees an "app is unable to process your
++        # request" card with nothing in the gateway log. Prefer the authoritative
++        # field; keep the name transform only as a fallback for mock/legacy paths.
++        real_topic = getattr(sub, "topic", "") or ""
++        if real_topic.startswith("projects/"):
++            self._click_topic_path = real_topic
++        else:
++            self._click_topic_path = subscription_path.replace("/subscriptions/", "/topics/") if subscription_path else None
++            logger.warning("[GoogleChat] no topic field on subscription response; clarify click topic derived from subscription name")
+         return True
+ 
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+@@ -1156,8 +1170,23 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         if not choices:
+             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+ 
++        # Pub/Sub-connected apps: Chat publishes the CARD_CLICKED event to the
++        # topic named by the button's action function — a bare function name
++        # fails with "Invalid resource name" (gsuiteaddons error log) and the
++        # user sees "app is unable to process your request". Use the full
++        # topic path so the click lands in the existing subscription — the REAL
++        # binding captured at connect (a name-derived path 404s when the topic
++        # is off-convention; see _check_subscription).
++        # HTTP-callback mode keeps the bare function name (actionMethodName).
++        if self._click_topic_path:
++            click_function = self._click_topic_path
++        elif self._subscription_path:
++            click_function = self._subscription_path.replace("/subscriptions/", "/topics/")
++        else:
++            click_function = "hermes_clarify"
++
+         def _button(text: str, choice: str) -> dict[str, Any]:
+-            return {"text": text, "action": "hermes_clarify", "parameters": {"clarify_id": clarify_id, "choice": choice}}
++            return {"text": text, "action": click_function, "parameters": {"clarify_id": clarify_id, "choice": choice}}
+         clean = [s for s in (str(c).strip() for c in choices) if s]
+         # Card buttons clip long labels with no tooltip (#78115): list the full options in the
+         # text widget and label the buttons positionally when any option is that wide.
+diff --git a/tests/gateway/test_google_chat.py b/tests/gateway/test_google_chat.py
+index 95d44ca149..a9d979beb2 100644
+--- a/tests/gateway/test_google_chat.py
++++ b/tests/gateway/test_google_chat.py
+@@ -846,7 +846,9 @@ class TestSend:
+         assert card["cardId"] == "clarify-clarify123"
+         buttons = card["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
+         assert buttons[0]["text"] == "Simple"
+-        assert buttons[0]["onClick"]["action"]["function"] == "hermes_clarify"
++        # Pub/Sub mode: the action names the topic the subscription binds to (name-transform
++        # fallback here — the fixture never runs _check_subscription), never a bare function name.
++        assert buttons[0]["onClick"]["action"]["function"] == "projects/test-project/topics/test-sub"
+         assert {"key": "choice", "value": "Simple"} in buttons[0]["onClick"]["action"]["parameters"]
+         assert buttons[-1]["text"] == t("platform.google_chat.clarify.other_button")
+         assert adapter._clarify_state["clarify123"] == "session-key"
+diff --git a/tests/gateway/test_google_chat_card_click.py b/tests/gateway/test_google_chat_card_click.py
+new file mode 100644
+index 0000000000..0717cbd314
+--- /dev/null
++++ b/tests/gateway/test_google_chat_card_click.py
+@@ -0,0 +1,95 @@
++"""Google Chat card clicks over Pub/Sub: topic-path derivation, payload-shape routing, clarify
++resolution, and ack semantics.
++
++Importing ``tests.gateway.test_google_chat`` first installs the google-* stubs into ``sys.modules``
++before the adapter is imported (the real libraries are optional deps).
++"""
++import asyncio
++import json
++import logging
++import threading
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from tests.gateway.test_google_chat import adapter  # importing installs the google stubs first
++import plugins.platforms.google_chat.adapter as _gc_mod
++
++SUB = "projects/test-project/subscriptions/gchat-acme-hermes-sub"
++REAL_TOPIC = "projects/test-project/topics/gchat-acme-hermes"  # the real binding, no "-sub"
++NAME_TRANSFORM = "projects/test-project/topics/gchat-acme-hermes-sub"
++
++
++def _click_envelope(clarify_id="cid-1", choice="Simple", *, msg_name="spaces/S/messages/M.CLARIFY"):
++    """Native CARD_CLICKED envelope: the clicked button carries the parameters."""
++    return {
++        "type": "CARD_CLICKED",
++        "commonEventObject": {},
++        "user": {"name": "users/12345", "displayName": "Ann", "type": "HUMAN"},
++        "space": {"name": "spaces/S"},
++        "message": {"name": msg_name, "text": "Pick one", "space": {"name": "spaces/S"}},
++        "action": {"actionMethodName": "click", "parameters": [
++            {"key": "clarify_id", "value": clarify_id}, {"key": "choice", "value": choice}]},
++    }
++
++
++# ===========================================================================
++# Topic-path derivation
++# ===========================================================================
++
++
++class TestClickTopicDerivation:
++    """A Pub/Sub-connected Chat app publishes CARD_CLICKED to the topic NAMED BY THE BUTTON, so the
++    button action must carry the subscription's real topic — a name-transform guess 404s at publish
++    whenever the topic is off-convention (``<name>-sub`` bound to ``<name>``)."""
++
++    @pytest.mark.asyncio
++    async def test_check_subscription_captures_the_real_topic_binding(self, adapter, monkeypatch, caplog):
++        subscriber = MagicMock()
++        subscriber.get_subscription.return_value = SimpleNamespace(topic=REAL_TOPIC)
++        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=MagicMock(return_value=subscriber)))
++
++        with caplog.at_level(logging.WARNING):
++            assert await adapter._check_subscription(SUB, credentials=MagicMock()) is True
++
++        assert REAL_TOPIC != NAME_TRANSFORM, "fixture must be off-convention to prove the point"
++        assert adapter._click_topic_path == REAL_TOPIC
++        assert "no topic field" not in caplog.text
++
++    @pytest.mark.asyncio
++    async def test_check_subscription_falls_back_to_the_name_transform_without_a_topic_field(
++            self, adapter, monkeypatch, caplog):
++        subscriber = MagicMock()
++        subscriber.get_subscription.return_value = SimpleNamespace(topic="")  # mock / legacy path
++        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=MagicMock(return_value=subscriber)))
++
++        with caplog.at_level(logging.WARNING):
++            assert await adapter._check_subscription(SUB, credentials=MagicMock()) is True
++
++        assert adapter._click_topic_path == NAME_TRANSFORM
++        assert "derived from subscription name" in caplog.text
++
++    @pytest.mark.asyncio
++    async def test_buttons_carry_the_real_topic_not_the_name_transform(self, adapter):
++        adapter._click_topic_path = REAL_TOPIC
++        adapter._create_message = AsyncMock(return_value=MagicMock(success=True, message_id="m/1", error=None))
++
++        assert (await adapter.send_clarify("spaces/S", "Pick", ["Simple", "Plain"], "c1", "sk")).success
++
++        buttons = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
++        assert {b["onClick"]["action"]["function"] for b in buttons} == {REAL_TOPIC}
++        assert {"key": "clarify_id", "value": "c1"} in buttons[0]["onClick"]["action"]["parameters"]
++        assert {"key": "choice", "value": "Simple"} in buttons[0]["onClick"]["action"]["parameters"]
++
++    @pytest.mark.asyncio
++    async def test_http_callback_mode_keeps_the_bare_action_name(self, adapter):
++        """No subscription → no topic to publish to; HTTP mode routes by actionMethodName."""
++        adapter._click_topic_path = None
++        adapter._subscription_path = None
++        adapter._create_message = AsyncMock(return_value=MagicMock(success=True, message_id="m/1", error=None))
++
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        buttons = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
++        assert {b["onClick"]["action"]["function"] for b in buttons} == {"hermes_clarify"}
+-- 
+2.53.0
+

@@ -1,0 +1,205 @@
+From 118bb3b014d56fee5c3d69fff9ea898664a086be Mon Sep 17 00:00:00 2001
+From: patrickdass93 <patrickdass93@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:15:24 +0800
+Subject: [PATCH 3/4] fix(gchat): route card clicks on payload shape, not the
+ ce-type string
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The ce-type attribute is the primary event router, but its exact string is not
+stable across Chat surfaces: on the add-ons surface it arrives EMPTY, and a
+click whose ce-type misses "widget"/"card" fell through to the MESSAGE branch,
+failed it, and was ACKed silently — the user's tap ended in nothing and the
+gateway log stayed empty, so an empty Pub/Sub backlog could not even prove the
+event had never arrived.
+
+A click is now also recognised by payload shape (_looks_like_card_click):
+type CARD_CLICKED, chat.cardClickPayload (Workspace add-on) or
+chat.buttonClickedPayload (Chat add-ons envelope, whose button parameters ride
+the envelope-level commonEventObject rather than the sub-dict). Every other
+event that is not a MESSAGE is logged at WARNING with its ce-type and a
+redacted envelope before it is acked, so an unmatched shape is visible instead
+of silently dropped.
+---
+ plugins/platforms/google_chat/adapter.py     | 45 +++++++++
+ tests/gateway/test_google_chat_card_click.py | 96 +++++++++++++++++++-
+ 2 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index 5d3b9d47c2..fe0bd43866 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -852,6 +852,26 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         ctx = self._scope_ctx.copy() if self._scope_ctx is not None else contextvars.copy_context()
+         ctx.run(self._handle_pubsub_message, message)
+ 
++    @staticmethod
++    def _looks_like_card_click(envelope: dict[str, Any]) -> bool:
++        """Payload-shape detection for CARD_CLICKED Pub/Sub events.
++
++        The ce-type attribute is the primary router (see _handle_pubsub_message),
++        but its exact string is not guaranteed to contain "widget"/"card" on every
++        Chat surface (empty on the add-ons surface); when it doesn't,
++        route on payload shape instead of acking the click into silence. Covers
++        the three observed shapes: native ``{"type": "CARD_CLICKED", ...}``,
++        Workspace add-on ``{"chat": {"cardClickPayload": ...}}``, and the Chat
++        add-ons envelope ``{"chat": {"buttonClickedPayload": ...}}`` (button
++        parameters ride ``commonEventObject.parameters`` on that surface).
++        """
++        if not isinstance(envelope, dict):
++            return False
++        if envelope.get("type") == "CARD_CLICKED":
++            return True
++        chat = envelope.get("chat")
++        return isinstance(chat, dict) and ("cardClickPayload" in chat or "buttonClickedPayload" in chat)
++
+     def _handle_click_bounded(self, envelope: dict[str, Any]) -> bool:
+         """Run one CARD_CLICKED handler to completion before the ack decision.
+ 
+@@ -938,6 +958,31 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 else:
+                     message.nack()  # Pub/Sub redelivers; both resolve paths are idempotent
+                 return
++            elif self._looks_like_card_click(envelope):
++                # Pub/Sub ce-type strings for card clicks are not stable across
++                # Chat surfaces — a click whose ce-type misses the substrings
++                # above fell through to the MESSAGE branch, failed it, and was
++                # ACKed silently (buttons show a loading bar then vanish, gateway
++                # log empty). Route on payload shape instead.
++                logger.info("[GoogleChat] CARD_CLICKED via payload-shape fallback (ce-type=%r)", ce_type)
++                if self._handle_click_bounded(envelope):
++                    message.ack()
++                else:
++                    message.nack()  # Pub/Sub redelivers; both resolve paths are idempotent
++                return
++            elif envelope and not self._extract_message_payload(envelope, ce_type):
++                # Non-MESSAGE, non-click event shape — log before the silent ack so an
++                # unmatched shape stays visible (a silent ack here turned a one-line
++                # routing fix into a multi-session debug).
++                try:
++                    from agent.redact import redact_sensitive_text
++                    dump = redact_sensitive_text(json.dumps(envelope))
++                except Exception:
++                    dump = "<redact filter unavailable>"
++                logger.warning("[GoogleChat] Unrouted Pub/Sub event dropped: ce-type=%r keys=%s payload=%s",
++                               ce_type, list(envelope.keys()), dump[:2000])
++                message.ack()
++                return
+             else:
+                 prepared = self._prepare_inbound(envelope, ce_type)
+                 if prepared is not None:
+diff --git a/tests/gateway/test_google_chat_card_click.py b/tests/gateway/test_google_chat_card_click.py
+index 70ba154ea2..2edc707188 100644
+--- a/tests/gateway/test_google_chat_card_click.py
++++ b/tests/gateway/test_google_chat_card_click.py
+@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+ 
+-from tests.gateway.test_google_chat import adapter, _make_pubsub_message  # importing installs the google stubs first
++from tests.gateway.test_google_chat import GoogleChatAdapter, adapter, _make_pubsub_message  # importing installs the google stubs first
+ import plugins.platforms.google_chat.adapter as _gc_mod
+ import tools.clarify_gateway as _cg
+ 
+@@ -298,3 +298,97 @@ class TestClickAckSemantics:
+         while adapter.handle_message.await_count == 0 and time.monotonic() < deadline:
+             time.sleep(0.01)
+         assert adapter.handle_message.await_count == 1
++
++
++# ===========================================================================
++# Payload-shape routing: the ce-type string is not stable across Chat surfaces
++# ===========================================================================
++
++WORKSPACE_CLICK = {"chat": {"cardClickPayload": {  # Workspace add-on shape
++    "user": {"displayName": "Cy"}, "space": {"name": "spaces/S"}, "message": {"name": MSG_NAME},
++    "action": {"parameters": [{"key": "clarify_id", "value": "cid-w"}, {"key": "choice", "value": "Plain"}]},
++}}}
++ADDONS_CLICK = {"commonEventObject": {"parameters": {"clarify_id": "cid-a", "choice": "Plain"}},  # Chat add-ons shape
++                "chat": {"user": {"displayName": "Bo"},
++                         "buttonClickedPayload": {"space": {"name": "spaces/S"}, "message": {"name": MSG_NAME}}}}
++
++
++class TestLooksLikeCardClick:
++    @pytest.mark.parametrize("envelope", [
++        _click_envelope(),            # native {"type": "CARD_CLICKED", ...}
++        WORKSPACE_CLICK,              # {"chat": {"cardClickPayload": ...}}
++        ADDONS_CLICK,                 # {"chat": {"buttonClickedPayload": ...}} + envelope-level commonEventObject
++    ], ids=["native", "workspace-add-on", "chat-add-ons"])
++    def test_the_three_observed_shapes_are_recognized(self, envelope):
++        assert GoogleChatAdapter._looks_like_card_click(envelope) is True
++
++    @pytest.mark.parametrize("envelope", [
++        {}, None, "CARD_CLICKED", [{"type": "CARD_CLICKED"}],
++        {"type": "MESSAGE", "message": {"text": "hi"}},
++        {"chat": {"messagePayload": {"message": {"text": "hi"}}}},
++        {"commonEventObject": {"parameters": {"clarify_id": "x"}}},  # no click payload under chat
++    ], ids=["empty", "none", "str", "list", "native-message", "workspace-message", "parameters-only"])
++    def test_everything_else_is_not_a_click(self, envelope):
++        assert GoogleChatAdapter._looks_like_card_click(envelope) is False
++
++
++class TestClickRoutingByShape:
++    def test_add_ons_click_with_an_empty_ce_type_is_routed_not_dropped(self, adapter, live_loop, patch, pending, caplog, monkeypatch):
++        """The third shape: ce-type is EMPTY on that surface, so the ce-type router misses it and
++        only the payload gate sends it to the handler. Its parameters ride the ENVELOPE-level
++        commonEventObject, not the buttonClickedPayload sub-dict."""
++        pending("cid-a")
++        handler_calls = []
++
++        real = adapter._handle_card_click
++
++        async def spy(envelope):
++            handler_calls.append(envelope)
++            await real(envelope)
++
++        monkeypatch.setattr(adapter, "_handle_card_click", spy)
++        with caplog.at_level(logging.INFO):
++            adapter._on_pubsub_message(_click_msg(ADDONS_CLICK, ce_type=""))
++
++        assert handler_calls == [ADDONS_CLICK]
++        assert "CARD_CLICKED via payload-shape fallback (ce-type='')" in caplog.text
++        assert _patched_text(adapter) == _card_text("✅ Bo: Plain")
++        assert _cg.get_pending("cid-a") is None
++
++    def test_workspace_shape_with_a_mismatched_ce_type_is_routed_too(self, adapter, live_loop, patch, pending):
++        pending("cid-w")
++        adapter._on_pubsub_message(_click_msg(WORKSPACE_CLICK, ce_type="some.future.event.type"))
++        assert _patched_text(adapter) == _card_text("✅ Cy: Plain")
++
++    def test_message_with_an_unfamiliar_ce_type_still_dispatches(self, adapter, live_loop):
++        """The loud-drop branch must not swallow real messages whose ce-type we don't know."""
++        from tests.gateway.test_google_chat import _make_chat_envelope
++
++        msg = _make_pubsub_message(_make_chat_envelope(text="hi"), attributes={"ce-type": "some.future.event.type"})
++        adapter._on_pubsub_message(msg)
++        msg.ack.assert_called_once()
++        deadline = time.monotonic() + 5
++        while adapter.handle_message.await_count == 0 and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert adapter.handle_message.await_count == 1
++
++    def test_unrouted_event_is_logged_with_ce_type_and_redacted_payload_before_the_ack(
++            self, adapter, live_loop, monkeypatch, caplog):
++        import agent.redact
++
++        monkeypatch.setattr(agent.redact, "redact_sensitive_text", lambda text: f"<redacted:{len(text)}>")
++        monkeypatch.setattr(adapter, "_handle_card_click", AsyncMock())
++        envelope = {"chat": {"reactionPayload": {"emoji": "👍", "secret": "hunter2"}}}
++        msg = _click_msg(envelope, ce_type="google.workspace.chat.reaction.v1.created")
++
++        with caplog.at_level(logging.WARNING, logger="gateway.platforms.google_chat"):
++            adapter._on_pubsub_message(msg)
++
++        msg.ack.assert_called_once()
++        msg.nack.assert_not_called()
++        adapter._handle_card_click.assert_not_awaited()
++        line = next(rec for rec in caplog.records if "Unrouted Pub/Sub event dropped" in rec.getMessage())
++        assert "ce-type='google.workspace.chat.reaction.v1.created'" in line.getMessage()
++        assert "keys=['chat']" in line.getMessage()
++        assert "<redacted:" in line.getMessage() and "hunter2" not in line.getMessage()
++        adapter.handle_message.assert_not_awaited()
+-- 
+2.53.0
+

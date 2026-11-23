@@ -1,0 +1,869 @@
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 88fbea057a..20d5cde16c 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -1504,6 +1504,9 @@ platform:
+       other_button: "Other / type answer"
+       header: "Question"
+       question: "❓ {question}"
++      resolved: "✅ {user}: {choice}"
++      awaiting: "✏️ Awaiting typed answer from {user}…"
++      expired: "⏳ This prompt expired — please send a new request."
+     typing:
+       thinking: "Hermes is thinking…"
+       interrupted: "(interrupted)"
+diff --git a/plugins/platforms/google_chat/adapter.py b/plugins/platforms/google_chat/adapter.py
+index 3b792001a6..6593412b0f 100644
+--- a/plugins/platforms/google_chat/adapter.py
++++ b/plugins/platforms/google_chat/adapter.py
+@@ -4,7 +4,8 @@ Inbound: authenticated HTTP callbacks or a Cloud Pub/Sub pull subscription. Outb
+ Chat REST API (synchronous googleapiclient via ``asyncio.to_thread``). The Pub/Sub
+ callback runs on a background thread, so ``handle_message`` is scheduled thread-safely
+ onto the loop and never awaited there. Only MESSAGE events reach the agent; membership
+-events cache the bot id, card clicks are ACK'd only.
++events cache the bot id, card clicks resolve the pending clarify prompt and are acked only
++after the handler has run.
+ """
+ 
+ from __future__ import annotations
+@@ -397,6 +398,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
+     _RECONNECT_BASE_DELAY = 2.0
+     _RECONNECT_MAX_DELAY = 120.0
+     _LEGACY_USER_IDENTITY = "__legacy__"
++    # CARD_CLICKED budget: the handler is awaited BEFORE the ack, so it must finish well UNDER the
++    # subscription's ackDeadline (one that outruns it is redelivered mid-run). The backoff bounds a
++    # deterministic failure's redelivery rate (a bare nack redelivers near-immediately).
++    _CLICK_HANDLER_TIMEOUT = 120.0
++    _CLICK_NACK_BACKOFF = 5.0
+ 
+     def __init__(self, config: PlatformConfig):
+         # Bundled platform plugins are looked up by enum value (matches Teams, IRC).
+@@ -406,6 +412,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         _load_google_modules()
+         self._subscriber = self._chat_api = self._credentials = self._streaming_pull_future = None
+         self._project_id = self._subscription_path = self._bot_user_id = None  # bot id is users/{id}
++        self._click_topic_path: Optional[str] = None  # REAL topic the subscription binds to; card clicks publish here
+         self._supervisor_task: Optional[asyncio.Task] = None
+         self._loop: Optional[asyncio.AbstractEventLoop] = None
+         # The profile scope this adapter was connected under (multiplex: HERMES_HOME override + secret
+@@ -448,6 +455,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
+             extra, "http_events_audience", "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE", self._http_events_url)
+         self._http_events_service_account_email = self._str_setting(
+             extra, "http_events_service_account_email", "GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL").lower()
++        # Clarify buttons are ON by default. ``clarify_buttons: false`` under
++        # platforms.google_chat is a kill-switch that restores the base-class
++        # numbered-text prompt (typed replies resolve a button card too).
++        self._clarify_buttons = bool(extra.get("clarify_buttons", True))
+ 
+     @staticmethod
+     def _int_setting(extra: dict[str, Any], key: str, env_name: str, default: int) -> int:
+@@ -518,8 +529,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
+     def _loop_accepts_callbacks(loop: Optional[asyncio.AbstractEventLoop]) -> bool:
+         return loop is not None and not bool(getattr(loop, "is_closed", lambda: False)())
+ 
+-    def _submit_on_loop(self, coro: Any) -> None:
+-        """Schedule a coroutine on the adapter loop from a Pub/Sub callback thread."""
++    def _submit_on_loop(self, coro: Any, track: bool = True) -> Optional[Any]:
++        """Schedule a coroutine on the adapter loop from a Pub/Sub callback thread.
++
++        Returns the concurrent Future (None when scheduling failed). The default
++        ``track=True`` keeps fire-and-forget failure logging; callers that consume the
++        future themselves (awaited card-click handling) pass ``track=False`` so a
++        failure is not logged twice.
++        """
+         if not self._loop_accepts_callbacks(loop := self._loop):
+             # Shutdown race: safe to drop, Pub/Sub redelivers on next reconnect.
+             logger.warning("[GoogleChat] Loop not accepting callbacks; dropping event")
+@@ -537,8 +554,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         except RuntimeError:
+             logger.warning("[GoogleChat] Loop closed between check and submit")
+             return
+-        if future is not None:
++        if future is not None and track:
+             future.add_done_callback(self._log_background_failure)
++        return future
+ 
+     # -- bot identity --------------------------------------------------------
+     def _bot_id_cache_path(self) -> _Path:
+@@ -624,13 +642,26 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         }
+         self._subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+         try:
+-            await asyncio.to_thread(lambda: self._subscriber.get_subscription(request={"subscription": subscription_path}))
++            sub = await asyncio.to_thread(lambda: self._subscriber.get_subscription(request={"subscription": subscription_path}))
+         except (gax_exceptions.NotFound, gax_exceptions.PermissionDenied) as exc:
+             code, message = fatals[type(exc)]
+             self._set_fatal_error(code=code, message=message, retryable=False)
+             return False
+         except Exception as exc:
+             return self._connect_failed("[GoogleChat] subscription.get failed: %s", exc, "subscription_check", retryable=True)
++        # The get_subscription response carries the subscription's REAL topic
++        # binding. Button clicks publish to the topic named by the button action,
++        # and deriving it from the subscription NAME ("/subscriptions/" →
++        # "/topics/") 404s whenever the topic is off-convention: every click
++        # dies at publish and the user sees an "app is unable to process your
++        # request" card with nothing in the gateway log. Prefer the authoritative
++        # field; keep the name transform only as a fallback for mock/legacy paths.
++        real_topic = getattr(sub, "topic", "") or ""
++        if real_topic.startswith("projects/"):
++            self._click_topic_path = real_topic
++        else:
++            self._click_topic_path = subscription_path.replace("/subscriptions/", "/topics/") if subscription_path else None
++            logger.warning("[GoogleChat] no topic field on subscription response; clarify click topic derived from subscription name")
+         return True
+ 
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+@@ -825,6 +856,71 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         ctx = self._scope_ctx.copy() if self._scope_ctx is not None else contextvars.copy_context()
+         ctx.run(self._handle_pubsub_message, message)
+ 
++    @staticmethod
++    def _looks_like_card_click(envelope: dict[str, Any]) -> bool:
++        """Payload-shape detection for CARD_CLICKED Pub/Sub events.
++
++        The ce-type attribute is the primary router (see _handle_pubsub_message),
++        but its exact string is not guaranteed to contain "widget"/"card" on every
++        Chat surface (empty on the add-ons surface); when it doesn't,
++        route on payload shape instead of acking the click into silence. Covers
++        the three observed shapes: native ``{"type": "CARD_CLICKED", ...}``,
++        Workspace add-on ``{"chat": {"cardClickPayload": ...}}``, and the Chat
++        add-ons envelope ``{"chat": {"buttonClickedPayload": ...}}`` (button
++        parameters ride ``commonEventObject.parameters`` on that surface).
++        """
++        if not isinstance(envelope, dict):
++            return False
++        if envelope.get("type") == "CARD_CLICKED":
++            return True
++        chat = envelope.get("chat")
++        return isinstance(chat, dict) and ("cardClickPayload" in chat or "buttonClickedPayload" in chat)
++
++    def _handle_click_bounded(self, envelope: dict[str, Any]) -> bool:
++        """Run one CARD_CLICKED handler to completion before the ack decision.
++
++        Awaiting the handler converts click processing from at-most-once to
++        at-least-once: fire-and-forget submit + immediate ack silently dropped
++        clicks that hit a transient failure (Chat API 5xx, network blip) —
++        eternal loading bar for the user, a log line on our side. Google's own
++        pub-sub sample acks only after the handler returns, so its library
++        auto-nacks failed events and Pub/Sub redelivers; this matches that
++        semantics. Returns True -> ack, False -> nack (redelivery).
++
++        Safe under redelivery: the card patch rewrites identical content and
++        an already-resolved prompt hits the polite expired branch.
++        """
++        from concurrent.futures import wait as _cf_wait
++
++        if not self._loop_accepts_callbacks(self._loop):
++            return False  # shutdown race: avoid creating a coroutine that can't be scheduled
++        future = self._submit_on_loop(self._handle_card_click(envelope), track=False)
++        if future is None:
++            # Loop not accepting (shutdown race): redeliver on next connect.
++            return False
++        done, _ = _cf_wait({future}, timeout=self._CLICK_HANDLER_TIMEOUT)  # well under the ack deadline
++        if future in done:
++            exc = future.exception()  # None when the handler completed cleanly
++            if exc is None:
++                return True
++            logger.warning("[GoogleChat] card click handler failed; nacking for Pub/Sub redelivery",
++                           exc_info=exc)
++        else:
++            # A timeout must not leave the original handler running uncoordinated under
++            # a nack — redelivery would then run a SECOND handler concurrently. Cancel
++            # the task BEFORE the nack: a run_coroutine_threadsafe future cancels even
++            # mid-await (CancelledError lands at the handler's next await point).
++            cancelled = future.cancel()
++            logger.error(
++                "[GoogleChat] card click handler exceeded %ss; %s; nacking for redelivery", self._CLICK_HANDLER_TIMEOUT,
++                "handler task cancelled" if cancelled else "cancel refused (task finishing; redelivery may duplicate)")
++        # Bound the redelivery rate: a bare nack redelivers near-immediately,
++        # so a deterministic bug would hot-loop the subscription. The backoff
++        # keeps a retry every few seconds until the prompt expires and the handler
++        # starts acking via the expired branch.
++        time.sleep(self._CLICK_NACK_BACKOFF)
++        return False
++
+     def _handle_pubsub_message(self, message: Any) -> None:
+         if self._shutting_down:
+             message.nack()
+@@ -859,7 +955,38 @@ class GoogleChatAdapter(BasePlatformAdapter):
+                 else:
+                     logger.info("[GoogleChat] REMOVED_FROM_SPACE %s", space.get("name", "?"))
+             elif "widget" in ce_type or "card" in ce_type.lower():
+-                logger.info("[GoogleChat] Card/widget event ack'd (v2 feature, deferred)")
++                # CARD_CLICKED: resolve a pending clarify prompt from the button
++                # parameters (clarify_id + choice), then patch the card in place.
++                if self._handle_click_bounded(envelope):
++                    message.ack()
++                else:
++                    message.nack()  # Pub/Sub redelivers; both resolve paths are idempotent
++                return
++            elif self._looks_like_card_click(envelope):
++                # Pub/Sub ce-type strings for card clicks are not stable across
++                # Chat surfaces — a click whose ce-type misses the substrings
++                # above fell through to the MESSAGE branch, failed it, and was
++                # ACKed silently (buttons show a loading bar then vanish, gateway
++                # log empty). Route on payload shape instead.
++                logger.info("[GoogleChat] CARD_CLICKED via payload-shape fallback (ce-type=%r)", ce_type)
++                if self._handle_click_bounded(envelope):
++                    message.ack()
++                else:
++                    message.nack()  # Pub/Sub redelivers; both resolve paths are idempotent
++                return
++            elif envelope and not self._extract_message_payload(envelope, ce_type):
++                # Non-MESSAGE, non-click event shape — log before the silent ack so an
++                # unmatched shape stays visible (a silent ack here turned a one-line
++                # routing fix into a multi-session debug).
++                try:
++                    from agent.redact import redact_sensitive_text
++                    dump = redact_sensitive_text(json.dumps(envelope))
++                except Exception:
++                    dump = "<redact filter unavailable>"
++                logger.warning("[GoogleChat] Unrouted Pub/Sub event dropped: ce-type=%r keys=%s payload=%s",
++                               ce_type, list(envelope.keys()), dump[:2000])
++                message.ack()
++                return
+             else:
+                 prepared = self._prepare_inbound(envelope, ce_type)
+                 if prepared is not None:
+@@ -1155,9 +1282,26 @@ class GoogleChatAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         if not choices:
+             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
++        if not self._clarify_buttons:
++            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
++
++        # Pub/Sub-connected apps: Chat publishes the CARD_CLICKED event to the
++        # topic named by the button's action function — a bare function name
++        # fails with "Invalid resource name" (gsuiteaddons error log) and the
++        # user sees "app is unable to process your request". Use the full
++        # topic path so the click lands in the existing subscription — the REAL
++        # binding captured at connect (a name-derived path 404s when the topic
++        # is off-convention; see _check_subscription).
++        # HTTP-callback mode keeps the bare function name (actionMethodName).
++        if self._click_topic_path:
++            click_function = self._click_topic_path
++        elif self._subscription_path:
++            click_function = self._subscription_path.replace("/subscriptions/", "/topics/")
++        else:
++            click_function = "hermes_clarify"
+ 
+         def _button(text: str, choice: str) -> dict[str, Any]:
+-            return {"text": text, "action": "hermes_clarify", "parameters": {"clarify_id": clarify_id, "choice": choice}}
++            return {"text": text, "action": click_function, "parameters": {"clarify_id": clarify_id, "choice": choice}}
+         clean = [s for s in (str(c).strip() for c in choices) if s]
+         # Card buttons clip long labels with no tooltip (#78115): list the full options in the
+         # text widget and label the buttons positionally when any option is that wide.
+@@ -1176,12 +1320,101 @@ class GoogleChatAdapter(BasePlatformAdapter):
+         })
+         if numbered:
+             card["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"] += f"\n\n{numbered}"
++        # Advertise the typed path on the card as well: the click publish leg is
++        # Google-side and can fail without a trace, while a typed reply always resolves.
++        card["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"] += (
++            f"\n\n{t('gateway.clarify.hint_single')}")
+         result = await self.send_card(chat_id, card, metadata=metadata)
+         if result.success:
+             self._clarify_state[clarify_id] = session_key
+             return result
++        # The text fallback below is a success from the caller's side, so this is the
++        # only place a failed card send is visible: log it, never swallow it.
++        logger.warning("[GoogleChat] clarify card failed (%s); falling back to the text prompt", result.error)
+         return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+ 
++    async def _handle_card_click(self, envelope: dict[str, Any]) -> None:
++        """Resolve a clarify prompt from a CARD_CLICKED Pub/Sub event.
++
++        Envelope shapes: native ``{"type": "CARD_CLICKED", ...}``, Workspace
++        add-ons ``{"chat": {"cardClickPayload": ...}}``, or the Chat add-ons
++        envelope ``{"chat": {"buttonClickedPayload": ...}}`` (parameters on
++        ``commonEventObject.parameters``). The clicked widget's
++        parameters carry ``clarify_id`` + ``choice`` (set at render time).
++        Mirrors the Slack adapter's contract: resolve via clarify_gateway,
++        "other" flips to text-capture, expired id → honest expiry note.
++        """
++        try:
++            chat = envelope.get("chat") or {}
++            payload = chat.get("cardClickPayload") or chat.get("buttonClickedPayload") or envelope
++            message = payload.get("message") or {}
++            user = (((payload.get("user") or payload.get("common") or {}).get("displayName"))
++                    or (chat.get("user") or {}).get("displayName")) or "User"
++            # Parameters may be flat key/value pairs or Chat's list form.
++            params: dict[str, str] = {}
++
++            def _collect(obj: Any) -> None:
++                if not isinstance(obj, dict):
++                    return
++                raw = obj.get("parameters")
++                if isinstance(raw, dict):  # flat {k: v} form (add-on commonEventObject)
++                    params.update({str(k): str(v) for k, v in raw.items()})
++                elif isinstance(raw, list):  # Chat native [{key, value}] form
++                    for item in raw:
++                        if isinstance(item, dict) and "key" in item:
++                            params[str(item["key"])] = str(item.get("value", ""))
++
++            _collect(payload.get("action") or {})
++            _collect(payload.get("actionResponse") or {})
++            clicked = payload.get("clickedWidget") or {}
++            if isinstance(clicked, dict):
++                _collect(clicked)
++            common = payload.get("commonEventObject") or {}
++            _collect(common)
++            # Add-ons envelope: parameters ride the TOP-LEVEL commonEventObject,
++            # not the buttonClickedPayload sub-dict.
++            _collect(envelope.get("commonEventObject") or {})
++            if not params:
++                # Native event shape: parameters ride the clicked button directly.
++                for w in ([payload.get("parameters")] if isinstance(payload.get("parameters"), dict) else []):
++                    params.update({k: str(v) for k, v in w.items()})
++            clarify_id = params.get("clarify_id", "")
++            choice = params.get("choice", "")
++            if not clarify_id:
++                logger.info("[GoogleChat] CARD_CLICKED without clarify parameters; ignored")
++                return
++            from tools import clarify_gateway as _cg
++            msg_name = message.get("name") or ""
++
++            async def _ack_card(text: str) -> None:
++                if not msg_name:
++                    return
++                card_id = f"clarify-{clarify_id}"
++                card = card_spec_to_cards_v2({
++                    "card_id": card_id, "header": {"title": t("platform.google_chat.clarify.header")},
++                    "sections": [{"widgets": [{"type": "text", "text": text}]}],
++                })
++                try:
++                    await self._patch_message(msg_name, {"cardsV2": [card]})
++                except Exception as exc:  # the card patch is cosmetic
++                    logger.debug("[GoogleChat] clarify card patch failed: %s", exc)
++
++            expired_text = t("platform.google_chat.clarify.expired")
++            if choice == "__other__":
++                if _cg.mark_awaiting_text(clarify_id):
++                    await _ack_card(t("platform.google_chat.clarify.awaiting", user=user))
++                else:
++                    await _ack_card(expired_text)
++                return
++            if _cg.resolve_gateway_clarify(clarify_id, choice):
++                await _ack_card(t("platform.google_chat.clarify.resolved", user=user, choice=choice))
++                logger.info("[GoogleChat] Card click resolved clarify (id=%s, choice=%.60r)", clarify_id, choice)
++            else:
++                await _ack_card(expired_text)
++                logger.warning("[GoogleChat] clarify resolve failed for %s (expired/reset)", clarify_id)
++        except Exception:
++            logger.exception("[GoogleChat] CARD_CLICKED handler error")
++
+     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+         """Edit via ``messages.patch`` (required by the tool-progress / token-streaming
+         pipeline). ``finalize`` is unused: Chat's patch has no streaming lifecycle.
+diff --git a/tests/gateway/test_google_chat.py b/tests/gateway/test_google_chat.py
+index 95d44ca149..a9d979beb2 100644
+--- a/tests/gateway/test_google_chat.py
++++ b/tests/gateway/test_google_chat.py
+@@ -846,7 +846,9 @@ class TestSend:
+         assert card["cardId"] == "clarify-clarify123"
+         buttons = card["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
+         assert buttons[0]["text"] == "Simple"
+-        assert buttons[0]["onClick"]["action"]["function"] == "hermes_clarify"
++        # Pub/Sub mode: the action names the topic the subscription binds to (name-transform
++        # fallback here — the fixture never runs _check_subscription), never a bare function name.
++        assert buttons[0]["onClick"]["action"]["function"] == "projects/test-project/topics/test-sub"
+         assert {"key": "choice", "value": "Simple"} in buttons[0]["onClick"]["action"]["parameters"]
+         assert buttons[-1]["text"] == t("platform.google_chat.clarify.other_button")
+         assert adapter._clarify_state["clarify123"] == "session-key"
+diff --git a/tests/gateway/test_google_chat_card_click.py b/tests/gateway/test_google_chat_card_click.py
+new file mode 100644
+index 0000000000..dcbc4c9a68
+--- /dev/null
++++ b/tests/gateway/test_google_chat_card_click.py
+@@ -0,0 +1,455 @@
++"""Google Chat card clicks over Pub/Sub: topic-path derivation, payload-shape routing, clarify
++resolution, and ack semantics.
++
++Importing ``tests.gateway.test_google_chat`` first installs the google-* stubs into ``sys.modules``
++before the adapter is imported (the real libraries are optional deps).
++"""
++import asyncio
++import json
++import logging
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from tests.gateway.test_google_chat import GoogleChatAdapter, adapter, _make_pubsub_message  # importing installs the google stubs first
++import plugins.platforms.google_chat.adapter as _gc_mod
++import tools.clarify_gateway as _cg
++from gateway.config import PlatformConfig
++from gateway.platforms.base import BasePlatformAdapter
++
++SUB = "projects/test-project/subscriptions/gchat-acme-hermes-sub"
++REAL_TOPIC = "projects/test-project/topics/gchat-acme-hermes"  # the real binding, no "-sub"
++NAME_TRANSFORM = "projects/test-project/topics/gchat-acme-hermes-sub"
++
++
++def _click_envelope(clarify_id="cid-1", choice="Simple", *, msg_name="spaces/S/messages/M.CLARIFY"):
++    """Native CARD_CLICKED envelope: the clicked button carries the parameters."""
++    return {
++        "type": "CARD_CLICKED",
++        "commonEventObject": {},
++        "user": {"name": "users/12345", "displayName": "Ann", "type": "HUMAN"},
++        "space": {"name": "spaces/S"},
++        "message": {"name": msg_name, "text": "Pick one", "space": {"name": "spaces/S"}},
++        "action": {"actionMethodName": "click", "parameters": [
++            {"key": "clarify_id", "value": clarify_id}, {"key": "choice", "value": choice}]},
++    }
++
++
++# ===========================================================================
++# Topic-path derivation
++# ===========================================================================
++
++
++class TestClickTopicDerivation:
++    """A Pub/Sub-connected Chat app publishes CARD_CLICKED to the topic NAMED BY THE BUTTON, so the
++    button action must carry the subscription's real topic — a name-transform guess 404s at publish
++    whenever the topic is off-convention (``<name>-sub`` bound to ``<name>``)."""
++
++    @pytest.mark.asyncio
++    async def test_check_subscription_captures_the_real_topic_binding(self, adapter, monkeypatch, caplog):
++        subscriber = MagicMock()
++        subscriber.get_subscription.return_value = SimpleNamespace(topic=REAL_TOPIC)
++        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=MagicMock(return_value=subscriber)))
++
++        with caplog.at_level(logging.WARNING):
++            assert await adapter._check_subscription(SUB, credentials=MagicMock()) is True
++
++        assert REAL_TOPIC != NAME_TRANSFORM, "fixture must be off-convention to prove the point"
++        assert adapter._click_topic_path == REAL_TOPIC
++        assert "no topic field" not in caplog.text
++
++    @pytest.mark.asyncio
++    async def test_check_subscription_falls_back_to_the_name_transform_without_a_topic_field(
++            self, adapter, monkeypatch, caplog):
++        subscriber = MagicMock()
++        subscriber.get_subscription.return_value = SimpleNamespace(topic="")  # mock / legacy path
++        monkeypatch.setattr(_gc_mod, "pubsub_v1", MagicMock(SubscriberClient=MagicMock(return_value=subscriber)))
++
++        with caplog.at_level(logging.WARNING):
++            assert await adapter._check_subscription(SUB, credentials=MagicMock()) is True
++
++        assert adapter._click_topic_path == NAME_TRANSFORM
++        assert "derived from subscription name" in caplog.text
++
++    @pytest.mark.asyncio
++    async def test_buttons_carry_the_real_topic_not_the_name_transform(self, adapter):
++        adapter._click_topic_path = REAL_TOPIC
++        adapter._create_message = AsyncMock(return_value=MagicMock(success=True, message_id="m/1", error=None))
++
++        assert (await adapter.send_clarify("spaces/S", "Pick", ["Simple", "Plain"], "c1", "sk")).success
++
++        buttons = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
++        assert {b["onClick"]["action"]["function"] for b in buttons} == {REAL_TOPIC}
++        assert {"key": "clarify_id", "value": "c1"} in buttons[0]["onClick"]["action"]["parameters"]
++        assert {"key": "choice", "value": "Simple"} in buttons[0]["onClick"]["action"]["parameters"]
++
++    @pytest.mark.asyncio
++    async def test_http_callback_mode_keeps_the_bare_action_name(self, adapter):
++        """No subscription → no topic to publish to; HTTP mode routes by actionMethodName."""
++        adapter._click_topic_path = None
++        adapter._subscription_path = None
++        adapter._create_message = AsyncMock(return_value=MagicMock(success=True, message_id="m/1", error=None))
++
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        buttons = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"][1]["buttonList"]["buttons"]
++        assert {b["onClick"]["action"]["function"] for b in buttons} == {"hermes_clarify"}
++
++
++# ===========================================================================
++# Click handler: clarify resolution
++# ===========================================================================
++
++MSG_NAME = "spaces/S/messages/M.CLARIFY"
++SESSION = "card-click-test-session"
++
++
++@pytest.fixture()
++def patch(adapter):
++    adapter._patch_message = AsyncMock(return_value=MagicMock(success=True))
++    return adapter._patch_message
++
++
++@pytest.fixture()
++def pending():
++    """Register a pending clarify; dropped again afterwards (the store is module-global)."""
++    def _register(clarify_id, choices=("Simple", "Plain")):
++        return _cg.register(clarify_id, SESSION, "Pick one", list(choices), authority={})
++    yield _register
++    _cg.clear_session(SESSION)
++
++
++def _card_text(text: str) -> str:
++    """``text`` as the Chat card builder renders it into a text widget (it strips variation
++    selectors, so compare through the same builder rather than against the raw literal)."""
++    from plugins.platforms.google_chat.cards import card_spec_to_cards_v2
++
++    card = card_spec_to_cards_v2({"card_id": "x", "sections": [{"widgets": [{"type": "text", "text": text}]}]})
++    return card["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"]
++
++
++def _patched_text(adapter) -> str:
++    """The text widget of the last card the handler patched onto the clarify message."""
++    body = adapter._patch_message.await_args.args[1]
++    return body["cardsV2"][0]["card"]["sections"][0]["widgets"][0]["textParagraph"]["text"]
++
++
++EXPIRED = "⏳ This prompt expired — please send a new request."
++
++
++class TestHandleCardClick:
++    @pytest.mark.asyncio
++    async def test_choice_click_resolves_the_prompt_and_patches_the_card(self, adapter, patch, pending):
++        pending("cid-1")
++
++        await adapter._handle_card_click(_click_envelope("cid-1", "Simple"))
++
++        assert _cg.get_pending("cid-1") is None, "resolved: no longer pending"
++        patch.assert_awaited_once()
++        assert patch.await_args.args[0] == MSG_NAME
++        assert _patched_text(adapter) == _card_text("✅ Ann: Simple")
++
++    @pytest.mark.asyncio
++    async def test_other_button_flips_the_prompt_into_text_capture(self, adapter, patch, pending):
++        pending("cid-2")
++
++        await adapter._handle_card_click(_click_envelope("cid-2", "__other__"))
++
++        entry = _cg.get_pending("cid-2")
++        assert entry is not None and entry.awaiting_text is True, "stays pending for a typed answer"
++        assert _patched_text(adapter) == _card_text("✏️ Awaiting typed answer from Ann…")
++
++    @pytest.mark.asyncio
++    async def test_unknown_or_expired_id_gets_the_honest_expiry_note(self, adapter, patch, caplog):
++        with caplog.at_level(logging.WARNING):
++            await adapter._handle_card_click(_click_envelope("never-registered", "Simple"))
++
++        assert _patched_text(adapter) == _card_text(EXPIRED)
++        assert "resolve failed for never-registered" in caplog.text
++
++    @pytest.mark.asyncio
++    async def test_redelivered_click_on_a_resolved_prompt_lands_on_the_expired_branch(self, adapter, patch, pending):
++        """At-least-once delivery: a redelivery never raises and is acked, so it cannot loop."""
++        pending("cid-3")
++        await adapter._handle_card_click(_click_envelope("cid-3", "Simple"))
++
++        await adapter._handle_card_click(_click_envelope("cid-3", "Simple"))
++
++        assert patch.await_count == 2
++        assert _patched_text(adapter) == _card_text(EXPIRED)
++
++    @pytest.mark.asyncio
++    async def test_click_without_clarify_parameters_is_ignored(self, adapter, patch):
++        await adapter._handle_card_click({"type": "CARD_CLICKED", "action": {"parameters": [{"key": "x", "value": "y"}]}})
++        patch.assert_not_awaited()
++
++    @pytest.mark.asyncio
++    async def test_malformed_envelope_is_logged_not_raised(self, adapter, patch, caplog):
++        """A deterministic failure must not reach the nack path — it would redeliver forever."""
++        with caplog.at_level(logging.ERROR):
++            await adapter._handle_card_click({"type": "CARD_CLICKED", "chat": "not-a-dict"})
++
++        patch.assert_not_awaited()
++        assert "CARD_CLICKED handler error" in caplog.text
++
++
++# ===========================================================================
++# Ack semantics: the handler is awaited (bounded) before the ack decision
++# ===========================================================================
++
++CARD_CE_TYPE = "google.workspace.chat.card.v1.clicked"
++
++
++@pytest.fixture()
++def live_loop(adapter):
++    """A RUNNING loop on a daemon thread — what connect() leaves on the adapter — so the
++    Pub/Sub-callback-thread path really round-trips through run_coroutine_threadsafe."""
++    loop = asyncio.new_event_loop()
++    thread = threading.Thread(target=loop.run_forever, daemon=True)
++    thread.start()
++    adapter._loop = loop
++    yield loop
++    loop.call_soon_threadsafe(loop.stop)
++    thread.join(timeout=5)
++    loop.close()
++
++
++def _click_msg(envelope=None, ce_type=CARD_CE_TYPE):
++    return _make_pubsub_message(envelope if envelope is not None else _click_envelope(),
++                                attributes={"ce-type": ce_type})
++
++
++class TestClickAckSemantics:
++    def test_handler_runs_to_completion_before_the_ack(self, adapter, live_loop, monkeypatch):
++        handler = AsyncMock()
++        monkeypatch.setattr(adapter, "_handle_card_click", handler)
++        msg = _click_msg()
++
++        adapter._on_pubsub_message(msg)  # blocks on the callback thread until the handler is done
++
++        handler.assert_awaited_once()
++        msg.ack.assert_called_once()
++        msg.nack.assert_not_called()
++
++    def test_crash_nacks_for_redelivery_without_double_logging(self, adapter, live_loop, monkeypatch, caplog):
++        monkeypatch.setattr(adapter, "_handle_card_click", AsyncMock(side_effect=RuntimeError("boom")))
++        monkeypatch.setattr(adapter, "_CLICK_NACK_BACKOFF", 0)
++        msg = _click_msg()
++
++        with caplog.at_level(logging.WARNING):
++            adapter._on_pubsub_message(msg)
++
++        msg.nack.assert_called_once()
++        msg.ack.assert_not_called()
++        assert "card click handler failed; nacking" in caplog.text
++        assert "Background inbound processing failed" not in caplog.text, "track=False: not logged twice"
++
++    def test_timeout_cancels_the_handler_before_the_nack(self, adapter, live_loop, monkeypatch, caplog):
++        saw_cancel = threading.Event()
++
++        async def stuck(_envelope):
++            try:
++                await asyncio.sleep(30)
++            except asyncio.CancelledError:
++                saw_cancel.set()
++                raise
++
++        monkeypatch.setattr(adapter, "_handle_card_click", stuck)
++        monkeypatch.setattr(adapter, "_CLICK_HANDLER_TIMEOUT", 0.05)
++        monkeypatch.setattr(adapter, "_CLICK_NACK_BACKOFF", 0)
++        msg = _click_msg()
++
++        with caplog.at_level(logging.ERROR):
++            adapter._on_pubsub_message(msg)
++
++        msg.nack.assert_called_once()
++        msg.ack.assert_not_called()
++        assert "handler task cancelled; nacking for redelivery" in caplog.text
++        assert saw_cancel.wait(timeout=5), "the orphaned handler must see CancelledError"
++
++    @pytest.mark.parametrize("loop_state", ["none", "closed"])
++    def test_no_accepting_loop_nacks_without_creating_a_coroutine(self, adapter, monkeypatch, loop_state):
++        monkeypatch.setattr(adapter, "_CLICK_NACK_BACKOFF", 0)
++        if loop_state == "none":
++            adapter._loop = None
++        else:
++            adapter._loop.close()  # the fixture's fresh, never-started loop
++        handler = AsyncMock()
++        monkeypatch.setattr(adapter, "_handle_card_click", handler)
++        msg = _click_msg()
++
++        adapter._on_pubsub_message(msg)
++
++        msg.nack.assert_called_once()
++        msg.ack.assert_not_called()
++        assert handler.call_count == 0, "no coroutine may be created that nothing will await"
++
++    def test_message_events_still_dispatch_fire_and_forget_and_ack(self, adapter, live_loop):
++        from tests.gateway.test_google_chat import _make_chat_envelope
++
++        msg = _make_pubsub_message(_make_chat_envelope(text="hi"),
++                                   attributes={"ce-type": "google.workspace.chat.message.v1.created"})
++        adapter._on_pubsub_message(msg)
++
++        msg.ack.assert_called_once()
++        msg.nack.assert_not_called()
++        deadline = time.monotonic() + 5
++        while adapter.handle_message.await_count == 0 and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert adapter.handle_message.await_count == 1
++
++
++# ===========================================================================
++# Payload-shape routing: the ce-type string is not stable across Chat surfaces
++# ===========================================================================
++
++WORKSPACE_CLICK = {"chat": {"cardClickPayload": {  # Workspace add-on shape
++    "user": {"displayName": "Cy"}, "space": {"name": "spaces/S"}, "message": {"name": MSG_NAME},
++    "action": {"parameters": [{"key": "clarify_id", "value": "cid-w"}, {"key": "choice", "value": "Plain"}]},
++}}}
++ADDONS_CLICK = {"commonEventObject": {"parameters": {"clarify_id": "cid-a", "choice": "Plain"}},  # Chat add-ons shape
++                "chat": {"user": {"displayName": "Bo"},
++                         "buttonClickedPayload": {"space": {"name": "spaces/S"}, "message": {"name": MSG_NAME}}}}
++
++
++class TestLooksLikeCardClick:
++    @pytest.mark.parametrize("envelope", [
++        _click_envelope(),            # native {"type": "CARD_CLICKED", ...}
++        WORKSPACE_CLICK,              # {"chat": {"cardClickPayload": ...}}
++        ADDONS_CLICK,                 # {"chat": {"buttonClickedPayload": ...}} + envelope-level commonEventObject
++    ], ids=["native", "workspace-add-on", "chat-add-ons"])
++    def test_the_three_observed_shapes_are_recognized(self, envelope):
++        assert GoogleChatAdapter._looks_like_card_click(envelope) is True
++
++    @pytest.mark.parametrize("envelope", [
++        {}, None, "CARD_CLICKED", [{"type": "CARD_CLICKED"}],
++        {"type": "MESSAGE", "message": {"text": "hi"}},
++        {"chat": {"messagePayload": {"message": {"text": "hi"}}}},
++        {"commonEventObject": {"parameters": {"clarify_id": "x"}}},  # no click payload under chat
++    ], ids=["empty", "none", "str", "list", "native-message", "workspace-message", "parameters-only"])
++    def test_everything_else_is_not_a_click(self, envelope):
++        assert GoogleChatAdapter._looks_like_card_click(envelope) is False
++
++
++class TestClickRoutingByShape:
++    def test_add_ons_click_with_an_empty_ce_type_is_routed_not_dropped(self, adapter, live_loop, patch, pending, caplog, monkeypatch):
++        """The third shape: ce-type is EMPTY on that surface, so the ce-type router misses it and
++        only the payload gate sends it to the handler. Its parameters ride the ENVELOPE-level
++        commonEventObject, not the buttonClickedPayload sub-dict."""
++        pending("cid-a")
++        handler_calls = []
++
++        real = adapter._handle_card_click
++
++        async def spy(envelope):
++            handler_calls.append(envelope)
++            await real(envelope)
++
++        monkeypatch.setattr(adapter, "_handle_card_click", spy)
++        with caplog.at_level(logging.INFO):
++            adapter._on_pubsub_message(_click_msg(ADDONS_CLICK, ce_type=""))
++
++        assert handler_calls == [ADDONS_CLICK]
++        assert "CARD_CLICKED via payload-shape fallback (ce-type='')" in caplog.text
++        assert _patched_text(adapter) == _card_text("✅ Bo: Plain")
++        assert _cg.get_pending("cid-a") is None
++
++    def test_workspace_shape_with_a_mismatched_ce_type_is_routed_too(self, adapter, live_loop, patch, pending):
++        pending("cid-w")
++        adapter._on_pubsub_message(_click_msg(WORKSPACE_CLICK, ce_type="some.future.event.type"))
++        assert _patched_text(adapter) == _card_text("✅ Cy: Plain")
++
++    def test_message_with_an_unfamiliar_ce_type_still_dispatches(self, adapter, live_loop):
++        """The loud-drop branch must not swallow real messages whose ce-type we don't know."""
++        from tests.gateway.test_google_chat import _make_chat_envelope
++
++        msg = _make_pubsub_message(_make_chat_envelope(text="hi"), attributes={"ce-type": "some.future.event.type"})
++        adapter._on_pubsub_message(msg)
++        msg.ack.assert_called_once()
++        deadline = time.monotonic() + 5
++        while adapter.handle_message.await_count == 0 and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert adapter.handle_message.await_count == 1
++
++    def test_unrouted_event_is_logged_with_ce_type_and_redacted_payload_before_the_ack(
++            self, adapter, live_loop, monkeypatch, caplog):
++        import agent.redact
++
++        monkeypatch.setattr(agent.redact, "redact_sensitive_text", lambda text: f"<redacted:{len(text)}>")
++        monkeypatch.setattr(adapter, "_handle_card_click", AsyncMock())
++        envelope = {"chat": {"reactionPayload": {"emoji": "👍", "secret": "hunter2"}}}
++        msg = _click_msg(envelope, ce_type="google.workspace.chat.reaction.v1.created")
++
++        with caplog.at_level(logging.WARNING, logger="gateway.platforms.google_chat"):
++            adapter._on_pubsub_message(msg)
++
++        msg.ack.assert_called_once()
++        msg.nack.assert_not_called()
++        adapter._handle_card_click.assert_not_awaited()
++        line = next(rec for rec in caplog.records if "Unrouted Pub/Sub event dropped" in rec.getMessage())
++        assert "ce-type='google.workspace.chat.reaction.v1.created'" in line.getMessage()
++        assert "keys=['chat']" in line.getMessage()
++        assert "<redacted:" in line.getMessage() and "hunter2" not in line.getMessage()
++        adapter.handle_message.assert_not_awaited()
++
++
++# ===========================================================================
++# Clarify card send: buttons by default, kill-switch, text fallback
++# ===========================================================================
++
++
++@pytest.fixture()
++def base_clarify(monkeypatch):
++    """The base-class numbered-text prompt, so tests can see when the card path defers to it."""
++    mock = AsyncMock(return_value=MagicMock(success=True, message_id="text/1", error=None))
++    monkeypatch.setattr(BasePlatformAdapter, "send_clarify", mock)
++    return mock
++
++
++def _ok_create(adapter):
++    adapter._create_message = AsyncMock(
++        return_value=MagicMock(success=True, message_id="m/1", error=None, raw_response=None))
++
++
++class TestClarifyButtons:
++    def test_buttons_are_on_by_default(self, adapter):
++        assert adapter._clarify_buttons is True
++
++    def test_kill_switch_is_read_from_the_platform_config_block(self):
++        cfg = PlatformConfig.from_dict({"enabled": True, "clarify_buttons": False})
++        assert cfg.extra["clarify_buttons"] is False
++        assert GoogleChatAdapter(cfg)._clarify_buttons is False
++
++    @pytest.mark.asyncio
++    async def test_kill_switch_restores_the_text_prompt(self, adapter, base_clarify):
++        adapter._clarify_buttons = False
++        _ok_create(adapter)
++
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        base_clarify.assert_awaited_once()
++        adapter._create_message.assert_not_awaited()
++        assert "c1" not in adapter._clarify_state
++
++    @pytest.mark.asyncio
++    async def test_card_send_failure_falls_back_to_the_text_prompt_and_is_logged(self, adapter, base_clarify, caplog):
++        adapter._create_message = AsyncMock(side_effect=ConnectionError("chat api 503"))
++
++        with caplog.at_level(logging.WARNING):
++            result = await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++
++        assert result is base_clarify.return_value, "the caller gets the text prompt's result"
++        assert "clarify card failed (chat api 503); falling back to the text prompt" in caplog.text
++        assert "c1" not in adapter._clarify_state
++
++    @pytest.mark.asyncio
++    async def test_card_advertises_the_typed_path(self, adapter):
++        from agent.i18n import t
++
++        _ok_create(adapter)
++        await adapter.send_clarify("spaces/S", "Pick", ["Simple"], "c1", "sk")
++        widgets = adapter._create_message.await_args.args[1]["cardsV2"][0]["card"]["sections"][0]["widgets"]
++        assert widgets[0]["textParagraph"]["text"].endswith(t("gateway.clarify.hint_single"))
+diff --git a/website/docs/user-guide/messaging/google_chat.md b/website/docs/user-guide/messaging/google_chat.md
+index ebc8e582f9..4cfe9b4302 100644
+--- a/website/docs/user-guide/messaging/google_chat.md
++++ b/website/docs/user-guide/messaging/google_chat.md
+@@ -250,10 +250,27 @@ separate Hermes session.
+ When the agent asks a multiple-choice clarify question, the adapter renders it
+ as a native **Card v2** with one button per choice plus an
+ **"Other / type answer"** button, instead of a plain numbered text list.
+-Clicking a button answers the question directly (`CARD_CLICKED` events route
+-the choice back into the waiting session). If the card fails to send, or the
+-question has no fixed choices, the adapter falls back to the standard text
+-clarify. No configuration needed.
++Clicking a button answers the question directly: the click travels back
++through the same Pub/Sub subscription (each button names the subscription's
++topic), resolves the waiting session, and the card is patched in place to show
++who answered what. The card also lists the options as text, so a typed reply
++(the number, the option text, or your own answer) works too — that is the
++resilient path, because the click's publish leg is Google-side and can fail
++without any trace on your side. If the card fails to send, or the question has
++no fixed choices, the adapter falls back to the standard text clarify and logs
++the card failure at WARNING.
++
++Buttons are on by default. To switch them off and get plain numbered text
++prompts only, set in `config.yaml`:
++
++```yaml
++platforms:
++  google_chat:
++    clarify_buttons: false
++```
++
++The setting is read once when the adapter starts, so restart the gateway after
++changing it.
+ 
+ ---
+ 
